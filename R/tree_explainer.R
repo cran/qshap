@@ -8,9 +8,10 @@ NULL
 #' Create a QSHAP Tree Explainer
 #' 
 #' Creates an explainer object for computing feature-specific Shapley values
-#' from a trained tree ensemble model. Supports XGBoost and LightGBM models.
+#' from a trained tree ensemble model. Supports XGBoost, LightGBM, and
+#' CatBoost models.
 #' 
-#' @param model A model object of class \code{xgboost} or \code{xgb.Booster} from \pkg{xgboost}, or class \code{lgb.Booster} from \pkg{lightgbm}
+#' @param model A model object of class \code{xgboost} or \code{xgb.Booster} from \pkg{xgboost}, class \code{lgb.Booster} from \pkg{lightgbm}, or class \code{catboost.Model} from \pkg{catboost}
 #' @param max_depth Maximum depth of trees, extracted from \code{model} by default.
 #' @param base_score Base score for predictions, extracted from \code{model} by default.
 #' @param ... Additional arguments, for future use
@@ -31,6 +32,11 @@ NULL
 #' @export
 gazer <- function(model, max_depth = NULL, base_score = NULL, ...) {
   UseMethod("gazer")
+}
+
+cache_tree_summaries <- function(explainer) {
+  explainer$tree_summaries <- lapply(explainer$trees, summarize_tree)
+  explainer
 }
 
 #' @export
@@ -83,6 +89,8 @@ gazer.xgb.Booster <- function(model, ...) {
     store_v_invc = store_complex_v_invc(max_depth * 2),
     store_z = store_complex_root(max_depth * 2)
   )
+
+  explainer <- cache_tree_summaries(explainer)
   
   validate_qshap_tree_explainer(explainer)
   explainer
@@ -105,7 +113,38 @@ gazer.lgb.Booster <- function(model, max_depth = NULL, ...) {
     store_v_invc = store_complex_v_invc(max_depth * 2),
     store_z = store_complex_root(max_depth * 2)
   )
+
+  explainer <- cache_tree_summaries(explainer)
   
+  validate_qshap_tree_explainer(explainer)
+  explainer
+}
+
+#' @export
+gazer.catboost.Model <- function(model, max_depth = NULL, ...) {
+  # Format CatBoost trees (returns list with metadata attributes)
+  cb_trees <- catboost_formatter(model, max_depth)
+
+  # Extract metadata set by formatter
+  bias <- attr(cb_trees, "bias")
+  if (is.null(bias)) bias <- 0.0
+  actual_max_depth <- attr(cb_trees, "max_depth")
+  if (is.null(actual_max_depth)) actual_max_depth <- 6L
+
+  if (is.null(max_depth)) max_depth <- actual_max_depth
+
+  explainer <- new_qshap_tree_explainer(
+    model = model,
+    model_type = "catboost",
+    max_depth = max_depth,
+    base_score = bias,
+    trees = cb_trees,
+    store_v_invc = store_complex_v_invc(max_depth * 2),
+    store_z = store_complex_root(max_depth * 2)
+  )
+
+  explainer <- cache_tree_summaries(explainer)
+
   validate_qshap_tree_explainer(explainer)
   explainer
 }
@@ -141,6 +180,7 @@ qshap_loss.qshap_tree_explainer <- function(explainer, x, y, y_mean_ori = NULL) 
   switch(explainer$model_type,
     "xgboost" = qshap_loss_xgboost(explainer, x, y, y_mean_ori),
     "lightgbm" = qshap_loss_lightgbm(explainer, x, y, y_mean_ori),
+    "catboost" = qshap_loss_catboost(explainer, x, y, y_mean_ori),
     # "gbm" = qshap_loss_gbm(explainer, x, y, y_mean_ori, progress_bar),
     stop("Unknown model type: ", explainer$model_type)
   )
@@ -241,10 +281,14 @@ qshap_rsq <- function(explainer, x, y, local = FALSE, nsample = NULL, sd_out = T
     rsq <- -colSums(loss) / sst
 
      if (sd_out) {
-      # sample variance across i for each feature j
       loss_mean <- colMeans(loss)
-      loss_var  <- colSums((loss - matrix(loss_mean, n, ncol(loss), byrow = TRUE))^2) / (n - 1)
-      sd_rsq    <- sqrt(n * loss_var) / sst
+      if (n > 1L) {
+        loss_sumsq <- colSums(loss * loss)
+        loss_var <- pmax((loss_sumsq - n * loss_mean^2) / (n - 1), 0)
+        sd_rsq <- sqrt(n * loss_var) / sst
+      } else {
+        sd_rsq <- rep(NA_real_, ncol(loss))
+      }
     } else {
       sd_rsq <- NULL
     }
@@ -313,8 +357,13 @@ if (local) {
 
   if (sd_out) {
       loss_mean <- colMeans(loss)
-      loss_var  <- colSums((loss - matrix(loss_mean, n_all, ncol(loss), byrow = TRUE))^2) / (n_all - 1)
-      sd_rsq    <- sqrt(n_all * loss_var) / sst
+      if (n_all > 1L) {
+        loss_sumsq <- colSums(loss * loss)
+        loss_var <- pmax((loss_sumsq - n_all * loss_mean^2) / (n_all - 1), 0)
+        sd_rsq <- sqrt(n_all * loss_var) / sst
+      } else {
+        sd_rsq <- rep(NA_real_, ncol(loss))
+      }
     } else {
       sd_rsq <- NULL
     }
@@ -335,17 +384,19 @@ if (local) {
 } else {
   # Combine sufficient statistics
   sum_all <- Reduce(`+`, lapply(results, `[[`, "sum"))
-  sumsq_all <- Reduce(`+`, lapply(results, `[[`, "sumsq"))
   n_all <- sum(vapply(results, `[[`, numeric(1), "n"))
 
   # point estimate
   rsq <- -sum_all / sst
 
   if (sd_out) {
-      sumsq_all <- Reduce(`+`, lapply(results, `[[`, "sumsq"))
-      # unbiased sample variance across i
-      loss_var <- (sumsq_all - (sum_all^2) / n_all) / (n_all - 1)
-      sd_rsq   <- sqrt(n_all * loss_var) / sst
+      if (n_all > 1L) {
+        sumsq_all <- Reduce(`+`, lapply(results, `[[`, "sumsq"))
+        loss_var <- pmax((sumsq_all - (sum_all^2) / n_all) / (n_all - 1), 0)
+        sd_rsq <- sqrt(n_all * loss_var) / sst
+      } else {
+        sd_rsq <- rep(NA_real_, length(sum_all))
+      }
     } else {
       sd_rsq <- NULL
     }

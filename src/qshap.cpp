@@ -1,20 +1,44 @@
 #include "qshap.h"
 #include <complex>
 #include <vector>
+#include <unordered_map>
 #include <cmath>
 #include <Eigen/Dense>
 
-#include <chrono>
-
-struct AccTimer
+// Compute a decision signature for a sample: for every internal node,
+// record whether x[feature] <= threshold. The weight matrix depends on
+// the sample's decision at ALL internal nodes (not just the path to the
+// sample's leaf), because traversal_weight() explores both branches and
+// uses x(split_feature) <= threshold to distribute weight at every node.
+// Two samples with identical signatures produce identical weight matrices.
+static std::vector<bool> compute_decision_signature(
+    const Eigen::VectorXd &x,
+    const TreeSummary &summary_tree)
 {
-    double &acc;
-    std::chrono::high_resolution_clock::time_point t0;
-    AccTimer(double &a) : acc(a), t0(std::chrono::high_resolution_clock::now()) {}
-    ~AccTimer()
+    const int nc = summary_tree.node_count;
+    std::vector<bool> sig(nc, false);
+    for (int v = 0; v < nc; v++)
     {
-        auto t1 = std::chrono::high_resolution_clock::now();
-        acc += std::chrono::duration<double>(t1 - t0).count();
+        if (summary_tree.children_left(v) >= 0) // internal node
+        {
+            sig[v] = (x(summary_tree.feature(v)) <= summary_tree.threshold(v));
+        }
+    }
+    return sig;
+}
+
+// Hash for vector<bool> to use as unordered_map key
+struct VecBoolHash
+{
+    size_t operator()(const std::vector<bool> &v) const
+    {
+        size_t seed = v.size();
+        for (size_t i = 0; i < v.size(); i++)
+        {
+            if (v[i])
+                seed ^= i + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        }
+        return seed;
     }
 };
 
@@ -37,12 +61,35 @@ Eigen::MatrixXd T2(
     }
     Eigen::Map<Eigen::VectorXd> init_prediction(init_prediction_vec.data(), init_prediction_vec.size());
 
-    Eigen::MatrixXd shap_value = Eigen::MatrixXd::Zero(x.rows(), x.cols());
+    const int n = x.rows();
+    const int p = x.cols();
+    Eigen::MatrixXd shap_value = Eigen::MatrixXd::Zero(n, p);
 
-    for (int i = 0; i < x.rows(); i++)
+    // Group samples by decision signature: for every internal node,
+    // record whether x[feature] <= threshold. Two samples with identical
+    // signatures produce identical weight matrices, so T2_sample gives
+    // identical results. We compute weight + T2_sample once per unique
+    // group, then broadcast. Complexity reduces from O(n * L^2 * D^2)
+    // to O(G * L^2 * D^2) where G = number of unique groups (<= min(n, 2^K)).
+    std::unordered_map<std::vector<bool>, std::vector<int>, VecBoolHash> groups;
+    groups.reserve(n);
+    for (int i = 0; i < n; i++)
     {
-        const auto w = weight(x.row(i), summary_tree);
-        T2_sample(i, w.first, w.second, init_prediction, store_v_invc, store_z, shap_value, summary_tree.feature_uniq);
+        auto sig = compute_decision_signature(x.row(i), summary_tree);
+        groups[std::move(sig)].push_back(i);
+    }
+
+    for (const auto &group : groups)
+    {
+        int representative = group.second[0];
+        const auto w = weight(x.row(representative), summary_tree);
+        T2_sample(representative, w.first, w.second, init_prediction,
+                  store_v_invc, store_z, shap_value, summary_tree.feature_uniq);
+
+        for (size_t k = 1; k < group.second.size(); k++)
+        {
+            shap_value.row(group.second[k]) = shap_value.row(representative);
+        }
     }
 
     return shap_value;
@@ -218,4 +265,149 @@ Eigen::MatrixXd loss_treeshap(
     }
 
     return loss;
+}
+
+// ---------------------------------------------------------------------------
+// TreeSHAP for a single tree (naïve subset enumeration).
+// Efficient for trees where the number of unique split features M <= ~20.
+// Complexity: O(n * M * 2^M * depth) per tree.
+// ---------------------------------------------------------------------------
+
+// Recursive conditional expectation: E[pred(x) | x_S]
+// feat_mask: bitmask over features_used indicating which are in S.
+static double cond_exp(
+    int node,
+    const Eigen::VectorXd &x,
+    int feat_mask,
+    const std::vector<int> &features_used,
+    const Eigen::VectorXi &cl,
+    const Eigen::VectorXi &cr,
+    const Eigen::VectorXi &feat,
+    const Eigen::VectorXd &thresh,
+    const Eigen::VectorXd &val,
+    const Eigen::VectorXd &nsamp)
+{
+    if (cl(node) < 0)
+        return val(node); // leaf
+
+    int f = feat(node);
+    int left = cl(node);
+    int right = cr(node);
+
+    // Check if this feature is conditioned on (in S)
+    bool conditioned = false;
+    for (size_t fi = 0; fi < features_used.size(); fi++)
+    {
+        if (features_used[fi] == f && (feat_mask & (1 << fi)))
+        {
+            conditioned = true;
+            break;
+        }
+    }
+
+    if (conditioned)
+    {
+        if (x(f) <= thresh(node))
+            return cond_exp(left, x, feat_mask, features_used, cl, cr, feat, thresh, val, nsamp);
+        else
+            return cond_exp(right, x, feat_mask, features_used, cl, cr, feat, thresh, val, nsamp);
+    }
+    else
+    {
+        double nl = nsamp(left);
+        double nr = nsamp(right);
+        double nt = nl + nr;
+        return (nl / nt) * cond_exp(left, x, feat_mask, features_used, cl, cr, feat, thresh, val, nsamp) +
+               (nr / nt) * cond_exp(right, x, feat_mask, features_used, cl, cr, feat, thresh, val, nsamp);
+    }
+}
+
+// [[Rcpp::export]]
+Eigen::MatrixXd compute_treeshap(
+    const Eigen::MatrixXd &x,
+    const Eigen::VectorXi &children_left,
+    const Eigen::VectorXi &children_right,
+    const Eigen::VectorXi &feature,
+    const Eigen::VectorXd &threshold,
+    const Eigen::VectorXd &value,
+    const Eigen::VectorXd &n_node_samples)
+{
+    const int n = x.rows();
+    const int p = x.cols();
+
+    // Find unique features used in splits
+    std::vector<int> features_used;
+    for (int v = 0; v < children_left.size(); v++)
+    {
+        if (children_left(v) >= 0)
+        {
+            int f = feature(v);
+            if (std::find(features_used.begin(), features_used.end(), f) == features_used.end())
+                features_used.push_back(f);
+        }
+    }
+    const int M = (int)features_used.size();
+
+    if (M > 20)
+        Rcpp::stop("compute_treeshap: tree uses %d unique features (max 20 for subset enumeration)", M);
+
+    // Precompute Shapley weights: w(s) = s! * (M-s-1)! / M!
+    std::vector<double> sw(M, 0.0);
+    {
+        std::vector<double> lf(M + 1, 0.0);
+        for (int i = 1; i <= M; i++)
+            lf[i] = lf[i - 1] + std::log((double)i);
+        for (int s = 0; s < M; s++)
+            sw[s] = std::exp(lf[s] + lf[M - s - 1] - lf[M]);
+    }
+
+    Eigen::MatrixXd shap_out = Eigen::MatrixXd::Zero(n, p);
+
+    for (int i = 0; i < n; i++)
+    {
+        const Eigen::VectorXd xi = x.row(i);
+
+        for (int fi = 0; fi < M; fi++)
+        {
+            int j = features_used[fi];
+            double phi = 0.0;
+
+            // Enumerate subsets of features_used \ {feature fi}
+            // other_count = M - 1; 2^(M-1) subsets
+            int other_count = M - 1;
+            int total_subsets = 1 << other_count;
+
+            for (int mask_other = 0; mask_other < total_subsets; mask_other++)
+            {
+                // Build full mask for S (without j) and S∪{j}
+                // Map bits of mask_other to features_used, skipping fi
+                int mask_S = 0;
+                int bit = 0;
+                for (int fi2 = 0; fi2 < M; fi2++)
+                {
+                    if (fi2 == fi)
+                        continue;
+                    if (mask_other & (1 << bit))
+                        mask_S |= (1 << fi2);
+                    bit++;
+                }
+                int mask_S_plus_j = mask_S | (1 << fi);
+
+                int s = __builtin_popcount(mask_S);
+
+                double v_with = cond_exp(0, xi, mask_S_plus_j, features_used,
+                                         children_left, children_right, feature,
+                                         threshold, value, n_node_samples);
+                double v_without = cond_exp(0, xi, mask_S, features_used,
+                                            children_left, children_right, feature,
+                                            threshold, value, n_node_samples);
+
+                phi += sw[s] * (v_with - v_without);
+            }
+
+            shap_out(i, j) = phi;
+        }
+    }
+
+    return shap_out;
 }
