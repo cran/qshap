@@ -26,7 +26,7 @@ NULL
 #' p <- 100
 #' X <- matrix(rnorm(n * p), nrow = n, ncol = p)
 #' y <- X[, 1] - X[, 2] + rnorm(n, sd = 0.2)
-#' model <- xgboost(X, y, nrounds = 15, max_depth = 2, verbose = 0)
+#' model <- xgboost(X, y, nrounds = 15, max_depth = 2, verbosity = 0, nthread = 1)
 #' explainer <- gazer(model)
 #'
 #' @export
@@ -131,7 +131,18 @@ gazer.catboost.Model <- function(model, max_depth = NULL, ...) {
   actual_max_depth <- attr(cb_trees, "max_depth")
   if (is.null(actual_max_depth)) actual_max_depth <- 6L
 
-  if (is.null(max_depth)) max_depth <- actual_max_depth
+  if (is.null(max_depth)) {
+    max_depth <- actual_max_depth
+  } else {
+    if (length(max_depth) != 1L || is.na(max_depth) || !is.finite(max_depth) ||
+        max_depth < 1 || max_depth != floor(max_depth)) {
+      stop("max_depth must be a positive integer.", call. = FALSE)
+    }
+    # The parsed model gives the exact required depth.  Smaller hints are not
+    # safe, while larger hints only inflate the O(depth^2) root caches and can
+    # overflow integer dimensions without changing the result.
+    max_depth <- actual_max_depth
+  }
 
   explainer <- new_qshap_tree_explainer(
     model = model,
@@ -194,21 +205,27 @@ qshap_loss.qshap_tree_explainer <- function(explainer, x, y, y_mean_ori = NULL) 
  #' @param explainer A qshap_tree_explainer object created by \code{gazer()}
  #' @param x Feature matrix or data frame with n samples and p features
  #' @param y Response vector of length n
- #' @param local Logical; if TRUE, returns both R-squared values and loss matrix
+ #' @param local Logical; if TRUE, also returns the raw observation-level
+ #'   squared-loss contributions in \code{loss} and their normalized
+ #'   contributions to the global R-squared decomposition in
+ #'   \code{local_rsq}.
  #' @param sd_out Logical; if TRUE, returns standard deviations of R-squared estimates
- #' @param ci_out Logical; if TRUE, returns Wald-style confidence intervals for each feature's R-squared (normal approximation using sd_rsq)
- #' @param level Confidence level for the intervals (default 0.95)
  #' @param nsample Optional integer; number of samples to use (random subsample if less than nrow(x))
  #' @param nfrac Optional numeric in (0,1); fraction of samples to use (alternative to nsample)
  #' @param random_state Integer seed for reproducible sampling
  #' @param ncore Number of cores for parallel processing. Use -1 for all available cores, 
  #'   or a positive integer. Default is 1 (no parallelization)
  #' 
- #' @return If \code{local=FALSE} (default), returns a numeric vector of length p 
- #'   containing feature-specific R-squared values. If \code{local=TRUE}, returns 
- #'   a list with components \code{rsq} (the R-squared vector) and \code{loss} 
- #'   (an n x p matrix of loss contributions). When \code{ci_out=TRUE}, the returned list
- #'   also contains \code{ci_lower} and \code{ci_upper} vectors representing Wald-style confidence intervals.
+ #' @return A \code{qshap_rsq} object containing the feature-specific
+ #'   R-squared vector in \code{rsq} and, when requested, \code{sd_rsq}. If
+ #'   \code{local=TRUE}, the object also contains \code{loss} and
+ #'   \code{local_rsq}.
+ #'   The \code{loss} matrix is the unchanged raw observation-level Shapley
+ #'   decomposition of the change in squared loss. If
+ #'   \eqn{Q_\emptyset = \sum_i (y_i - \bar y)^2}, then
+ #'   \code{local_rsq = -loss / Q_emptyset}. Thus, \code{local_rsq} contains
+ #'   observation-level contributions to the global R-squared decomposition;
+ #'   it is not an observation-specific coefficient of determination.
  #'   
  #' @examples
  #' library(xgboost)
@@ -217,14 +234,13 @@ qshap_loss.qshap_tree_explainer <- function(explainer, x, y, y_mean_ori = NULL) 
  #' p <- 100
  #' X <- matrix(rnorm(n * p), nrow = n, ncol = p)
  #' y <- X[, 1] - X[, 2] + rnorm(n, sd = 0.2)
- #' model <- xgboost(X, y, nrounds = 15, max_depth = 2, verbose = 0)
+ #' model <- xgboost(X, y, nrounds = 15, max_depth = 2, verbosity = 0, nthread = 1)
  #' explainer <- gazer(model)
  #' phi_rsq <- qshap(explainer, X, y)
  #' print(phi_rsq)
  #'
  #' @keywords internal
 qshap_rsq <- function(explainer, x, y, local = FALSE, nsample = NULL, sd_out = TRUE,
-                      ci_out = TRUE, level = 0.95,
                       nfrac = NULL, random_state = 42,
                       ncore = 1L) {
   # Sampling logic
@@ -247,20 +263,6 @@ qshap_rsq <- function(explainer, x, y, local = FALSE, nsample = NULL, sd_out = T
     y <- y[sample_idx]
   }
 
-  # CI implies we need sd estimates
-  if (isTRUE(ci_out)) sd_out <- TRUE
-  if (is.null(level) || length(level) != 1 || is.na(level) || level <= 0 || level >= 1) {
-    stop("level must be a single number in (0, 1)")
-  }
-
-  ci_from_sd <- function(rsq, sd_rsq, level) {
-    z <- stats::qnorm(1 - (1 - level) / 2)
-    list(
-      ci_lower = rsq - z * sd_rsq,
-      ci_upper = rsq + z * sd_rsq
-    )
-  }
-
   y_mean_ori <- mean(y)
   sst <- sum((y - y_mean_ori)^2)
 
@@ -274,6 +276,19 @@ qshap_rsq <- function(explainer, x, y, local = FALSE, nsample = NULL, sd_out = T
   ncore <- max(1L, min(max_core, ncore))
 
   n <- nrow(x)
+
+  if (identical(explainer$model_type, "catboost") && !isTRUE(local)) {
+    # Fast CatBoost global backend uses the Q-SHAP paper decomposition:
+    # loss[i, j] = T2[i, j] - 2 * r_i^(k-1) * T0[i, j],
+    # R_j^2 = -sum_i,k loss[i, j] / SST.
+    fast_stats <- qshap_catboost_fast_global_stats(explainer, x, y, compute_sd = sd_out)
+    rsq <- fast_stats$rsq
+    sd_rsq <- if (sd_out) fast_stats$sd_rsq else NULL
+
+    out <- list(rsq = rsq, sd_rsq = sd_rsq)
+    class(out) <- c("qshap_rsq", "list")
+    return(out)
+  }
 
   # Calculate loss (serial)
   if (ncore == 1L || n <= 1L) {
@@ -292,21 +307,16 @@ qshap_rsq <- function(explainer, x, y, local = FALSE, nsample = NULL, sd_out = T
     } else {
       sd_rsq <- NULL
     }
-    if (ci_out && !is.null(sd_rsq)) {
-      ci <- ci_from_sd(rsq, sd_rsq, level)
-    } else {
-      ci <- NULL
-    }
-
     if (local) {
-      out <- list(rsq = rsq, loss = loss, sd_rsq = sd_rsq)
+      local_rsq <- -loss / sst
+      out <- list(
+        rsq = rsq,
+        loss = loss,
+        local_rsq = local_rsq,
+        sd_rsq = sd_rsq
+      )
     } else {
       out <- list(rsq = rsq, sd_rsq = sd_rsq)
-    }
-    if (!is.null(ci)) {
-      out$ci_lower <- ci$ci_lower
-      out$ci_upper <- ci$ci_upper
-      out$level <- level
     }
     class(out) <- c("qshap_rsq", "list")
     return(out)
@@ -319,8 +329,34 @@ qshap_rsq <- function(explainer, x, y, local = FALSE, nsample = NULL, sd_out = T
   cl <- parallel::makeCluster(ncore)
   on.exit(parallel::stopCluster(cl), add = TRUE)
 
-  # Ensure package namespace is available on workers
-  parallel::clusterEvalQ(cl, suppressPackageStartupMessages(library(qshap)))
+  # Ensure workers load qshap from the same library paths as the main session.
+  # This matters after local/GitHub installs: otherwise PSOCK workers can pick
+  # up an older qshap without newer backends such as CatBoost.
+  qshap_lib_paths <- .libPaths()
+  parallel::clusterExport(cl, varlist = "qshap_lib_paths", envir = environment())
+  parallel::clusterEvalQ(cl, {
+    .libPaths(qshap_lib_paths)
+    suppressPackageStartupMessages(library(qshap))
+    NULL
+  })
+
+  if (identical(explainer$model_type, "catboost")) {
+    worker_has_catboost <- parallel::clusterEvalQ(
+      cl,
+      exists("qshap_loss_catboost", envir = asNamespace("qshap"), inherits = FALSE)
+    )
+    if (!all(unlist(worker_has_catboost))) {
+      worker_versions <- parallel::clusterEvalQ(cl, as.character(utils::packageVersion("qshap")))
+      stop(
+        "Parallel CatBoost Q-SHAP requires workers to load a CatBoost-enabled qshap. ",
+        "The workers loaded qshap version(s): ",
+        paste(unique(unlist(worker_versions)), collapse = ", "),
+        ". Reinstall qshap, restart R, and retry. For development sessions, use ",
+        "devtools::install() rather than only source()/load_all() before ncore > 1.",
+        call. = FALSE
+      )
+    }
+  }
 
   # Export needed data once (avoid resending for every task)
   parallel::clusterExport(
@@ -367,17 +403,13 @@ if (local) {
     } else {
       sd_rsq <- NULL
     }
-  if (ci_out && !is.null(sd_rsq)) {
-    ci <- ci_from_sd(rsq, sd_rsq, level)
-  } else {
-    ci <- NULL
-  }
-  out <- list(rsq = rsq, loss = loss, sd_rsq = sd_rsq)
-  if (!is.null(ci)) {
-    out$ci_lower <- ci$ci_lower
-    out$ci_upper <- ci$ci_upper
-    out$level <- level
-  }
+  local_rsq <- -loss / sst
+  out <- list(
+    rsq = rsq,
+    loss = loss,
+    local_rsq = local_rsq,
+    sd_rsq = sd_rsq
+  )
   class(out) <- c("qshap_rsq", "list")
   return(out)
 
@@ -400,17 +432,7 @@ if (local) {
     } else {
       sd_rsq <- NULL
     }
-  if (ci_out && !is.null(sd_rsq)) {
-    ci <- ci_from_sd(rsq, sd_rsq, level)
-  } else {
-    ci <- NULL
-  }
   out <- list(rsq = rsq, sd_rsq = sd_rsq)
-  if (!is.null(ci)) {
-    out$ci_lower <- ci$ci_lower
-    out$ci_upper <- ci$ci_upper
-    out$level <- level
-  }
   class(out) <- c("qshap_rsq", "list")
   return(out)
 }
@@ -434,10 +456,20 @@ if (local) {
 #'     \item \code{total_rsq}: Total R² (sum of feature-specific values)
 #'     \item \code{n_samples}: Number of samples
 #'     \item \code{n_features}: Number of features
-#'     \item \code{loss}: Loss matrix (if local=TRUE)
+#'     \item \code{loss}: Unchanged raw observation-level contributions to the
+#'       change in squared loss (if \code{local=TRUE})
+#'     \item \code{local_rsq}: Observation-level contributions to the global
+#'       R-squared decomposition, equal to \code{-loss / Q_emptyset}, where
+#'       \eqn{Q_\emptyset = \sum_i (y_i - \bar y)^2}. Its column sums equal
+#'       \code{rsq} up to numerical tolerance (if \code{local=TRUE})
 #'   }
 #'
 #' @details
+#' The \code{local_rsq} matrix contains local contributions on the R-squared
+#' scale. It decomposes each global feature-specific \code{rsq} value across
+#' observations and must not be interpreted as an observation-specific
+#' coefficient of determination.
+#'
 #' This function provides a user-friendly interface for Q-SHAP R² computation:
 #' \itemize{
 #'   \item Automatically extracts feature names from the input data
@@ -454,15 +486,15 @@ if (local) {
 #' p <- 100
 #' X <- matrix(rnorm(n * p), nrow = n, ncol = p)
 #' y <- X[, 1] - X[, 2] + rnorm(n, sd = 0.2)
-#' model <- xgboost(X, y, nrounds = 15, max_depth = 2, verbose = 0)
+#' model <- xgboost(X, y, nrounds = 15, max_depth = 2, verbosity = 0, nthread = 1)
 #' explainer <- gazer(model)
 #' result <- rsq(explainer, X, y)
 #' print(result)
 #'
 #' @seealso \code{\link{qshap_result}}
 #' @export
-rsq <- function(explainer, x, y, feature_names = NULL, local = FALSE, nsample = NULL, 
-                sd_out = TRUE, ci_out = TRUE, level = 0.95, nfrac = NULL, 
+rsq <- function(explainer, x, y, feature_names = NULL, local = FALSE, nsample = NULL,
+                sd_out = TRUE, nfrac = NULL,
                 random_state = 42, ncore = 1L) {
   
   # Call qshap_rsq
@@ -473,8 +505,6 @@ rsq <- function(explainer, x, y, feature_names = NULL, local = FALSE, nsample = 
     local = local,
     nsample = nsample,
     sd_out = sd_out,
-    ci_out = ci_out,
-    level = level,
     nfrac = nfrac,
     random_state = random_state,
     ncore = ncore
@@ -498,9 +528,12 @@ rsq <- function(explainer, x, y, feature_names = NULL, local = FALSE, nsample = 
   result$n_samples <- nrow(x)
   result$n_features <- length(result$rsq)
 
-  # Ensure loss is present only when local=TRUE
+  # Ensure local matrices are present only when local=TRUE.
   if (!isTRUE(local) && !is.null(result$loss)) {
     result$loss <- NULL
+  }
+  if (!isTRUE(local) && !is.null(result$local_rsq)) {
+    result$local_rsq <- NULL
   }
 
   class(result) <- c("qshap_result", "qshap_rsq", "list")
@@ -522,7 +555,7 @@ rsq <- function(explainer, x, y, feature_names = NULL, local = FALSE, nsample = 
 #' p <- 100
 #' X <- matrix(rnorm(n * p), nrow = n, ncol = p)
 #' y <- X[, 1] - X[, 2] + rnorm(n, sd = 0.2)
-#' model <- xgboost(X, y, nrounds = 15, max_depth = 2, verbose = 0)
+#' model <- xgboost(X, y, nrounds = 15, max_depth = 2, verbosity = 0, nthread = 1)
 #' explainer <- gazer(model)
 #' phi_rsq <- qshap(explainer, X, y)
 #' print(phi_rsq)
@@ -530,10 +563,10 @@ rsq <- function(explainer, x, y, feature_names = NULL, local = FALSE, nsample = 
 #' @seealso \code{\link{rsq}}
 #' @export
 qshap <- function(explainer, x, y, feature_names = NULL, local = FALSE,
-                  nsample = NULL, sd_out = TRUE, ci_out = TRUE, level = 0.95,
+                  nsample = NULL, sd_out = TRUE,
                   nfrac = NULL, random_state = 42, ncore = 1L) {
   rsq(explainer, x, y, feature_names = feature_names, local = local,
-      nsample = nsample, sd_out = sd_out, ci_out = ci_out, level = level,
+      nsample = nsample, sd_out = sd_out,
       nfrac = nfrac, random_state = random_state, ncore = ncore)
 }
 
@@ -552,7 +585,7 @@ qshap <- function(explainer, x, y, feature_names = NULL, local = FALSE,
 #' p <- 100
 #' X <- matrix(rnorm(n * p), nrow = n, ncol = p)
 #' y <- X[, 1] - X[, 2] + rnorm(n, sd = 0.2)
-#' model <- xgboost(X, y, nrounds = 15, max_depth = 2, verbose = 0)
+#' model <- xgboost(X, y, nrounds = 15, max_depth = 2, verbosity = 0, nthread = 1)
 #' explainer <- gazer(model)
 #' loss_matrix <- loss(explainer, X, y)
 #' dim(loss_matrix)

@@ -11,8 +11,6 @@ qshap_rsq(
   local = FALSE,
   nsample = NULL,
   sd_out = TRUE,
-  ci_out = TRUE,
-  level = 0.95,
   nfrac = NULL,
   random_state = 42,
   ncore = 1L
@@ -25,15 +23,14 @@ qshap_rsq(
 
 \item{y}{Response vector of length n}
 
-\item{local}{Logical; if TRUE, returns both R-squared values and loss matrix}
+\item{local}{Logical; if TRUE, also returns the raw observation-level
+squared-loss contributions in \code{loss} and their normalized
+contributions to the global R-squared decomposition in
+\code{local_rsq}.}
 
 \item{nsample}{Optional integer; number of samples to use (random subsample if less than nrow(x))}
 
 \item{sd_out}{Logical; if TRUE, returns standard deviations of R-squared estimates}
-
-\item{ci_out}{Logical; if TRUE, returns Wald-style confidence intervals for each feature's R-squared (normal approximation using sd_rsq)}
-
-\item{level}{Confidence level for the intervals (default 0.95)}
 
 \item{nfrac}{Optional numeric in (0,1); fraction of samples to use (alternative to nsample)}
 
@@ -43,11 +40,16 @@ qshap_rsq(
 or a positive integer. Default is 1 (no parallelization)}
 }
 \value{
-If \code{local=FALSE} (default), returns a numeric vector of length p 
-  containing feature-specific R-squared values. If \code{local=TRUE}, returns 
-  a list with components \code{rsq} (the R-squared vector) and \code{loss} 
-  (an n x p matrix of loss contributions). When \code{ci_out=TRUE}, the returned list
-  also contains \code{ci_lower} and \code{ci_upper} vectors representing Wald-style confidence intervals.
+A \code{qshap_rsq} object containing the feature-specific
+  R-squared vector in \code{rsq} and, when requested, \code{sd_rsq}. If
+  \code{local=TRUE}, the object also contains \code{loss} and
+  \code{local_rsq}.
+  The \code{loss} matrix is the unchanged raw observation-level Shapley
+  decomposition of the change in squared loss. If
+  \eqn{Q_\emptyset = \sum_i (y_i - \bar y)^2}, then
+  \code{local_rsq = -loss / Q_emptyset}. Thus, \code{local_rsq} contains
+  observation-level contributions to the global R-squared decomposition;
+  it is not an observation-specific coefficient of determination.
 }
 \description{
 Computes feature-specific R-squared values using Q-SHAP decomposition.
@@ -60,7 +62,7 @@ n <- 100
 p <- 100
 X <- matrix(rnorm(n * p), nrow = n, ncol = p)
 y <- X[, 1] - X[, 2] + rnorm(n, sd = 0.2)
-model <- xgboost(X, y, nrounds = 15, max_depth = 2, verbose = 0)
+model <- xgboost(X, y, nrounds = 15, max_depth = 2, verbosity = 0, nthread = 1)
 explainer <- gazer(model)
 phi_rsq <- qshap(explainer, X, y)
 print(phi_rsq)

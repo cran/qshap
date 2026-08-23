@@ -12,8 +12,6 @@ qshap(
   local = FALSE,
   nsample = NULL,
   sd_out = TRUE,
-  ci_out = TRUE,
-  level = 0.95,
   nfrac = NULL,
   random_state = 42,
   ncore = 1L
@@ -28,15 +26,14 @@ qshap(
 
 \item{feature_names}{Character vector of feature names. If NULL, uses column names from x.}
 
-\item{local}{Logical; if TRUE, returns both R-squared values and loss matrix}
+\item{local}{Logical; if TRUE, also returns the raw observation-level
+squared-loss contributions in \code{loss} and their normalized
+contributions to the global R-squared decomposition in
+\code{local_rsq}.}
 
 \item{nsample}{Optional integer; number of samples to use (random subsample if less than nrow(x))}
 
 \item{sd_out}{Logical; if TRUE, returns standard deviations of R-squared estimates}
-
-\item{ci_out}{Logical; if TRUE, returns Wald-style confidence intervals for each feature's R-squared (normal approximation using sd_rsq)}
-
-\item{level}{Confidence level for the intervals (default 0.95)}
 
 \item{nfrac}{Optional numeric in (0,1); fraction of samples to use (alternative to nsample)}
 
@@ -59,7 +56,7 @@ n <- 100
 p <- 100
 X <- matrix(rnorm(n * p), nrow = n, ncol = p)
 y <- X[, 1] - X[, 2] + rnorm(n, sd = 0.2)
-model <- xgboost(X, y, nrounds = 15, max_depth = 2, verbose = 0)
+model <- xgboost(X, y, nrounds = 15, max_depth = 2, verbosity = 0, nthread = 1)
 explainer <- gazer(model)
 phi_rsq <- qshap(explainer, X, y)
 print(phi_rsq)
